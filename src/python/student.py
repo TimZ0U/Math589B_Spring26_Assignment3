@@ -11,7 +11,7 @@ class OdeResult:
     y: np.ndarray
     status: int = 0
     success: bool = True
-    message: str = "Integration completed successfully."
+    message: str = "The solver successfully reached the end of the integration interval."
 
 
 def solve_continuous_are(
@@ -25,7 +25,7 @@ def solve_continuous_are(
 
         A^T P + P A - P B R^{-1} B^T P + Q = 0
 
-    with a Hamiltonian stable-subspace construction.
+    by extracting the stable invariant subspace of the Hamiltonian matrix.
     """
     A = np.asarray(A, dtype=float)
     B = np.asarray(B, dtype=float)
@@ -33,7 +33,7 @@ def solve_continuous_are(
     R = np.asarray(R, dtype=float)
 
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
-        raise ValueError("A must be a square matrix.")
+        raise ValueError("A must be square.")
 
     n = A.shape[0]
 
@@ -44,112 +44,108 @@ def solve_continuous_are(
     if R.ndim != 2 or R.shape[0] != R.shape[1]:
         raise ValueError("R must be square.")
 
-    Rinv = np.linalg.inv(R)
+    R_inv = np.linalg.inv(R)
 
-    h11 = A
-    h12 = -(B @ Rinv @ B.T)
-    h21 = -Q
-    h22 = -A.T
-
-    H = np.block([[h11, h12], [h21, h22]])
+    H = np.block([
+        [A, -B @ R_inv @ B.T],
+        [-Q, -A.T],
+    ])
 
     eigvals, eigvecs = np.linalg.eig(H)
 
-    stable_cols = [j for j, lam in enumerate(eigvals) if np.real(lam) < 0.0]
-    if len(stable_cols) != n:
+    stable_cols = np.where(np.real(eigvals) < 0.0)[0]
+    if stable_cols.size != n:
         raise np.linalg.LinAlgError(
-            f"Hamiltonian matrix does not have exactly {n} stable eigenvalues."
+            f"Expected {n} stable eigenvalues, found {stable_cols.size}."
         )
 
-    W = eigvecs[:, stable_cols]
-    X = W[:n, :]
-    Y = W[n:, :]
+    Z = eigvecs[:, stable_cols]
+    U = Z[:n, :]
+    V = Z[n:, :]
 
-    if np.linalg.matrix_rank(X) < n:
-        raise np.linalg.LinAlgError("Stable subspace basis is not invertible in the upper block.")
+    if np.linalg.matrix_rank(U) < n:
+        raise np.linalg.LinAlgError("Stable invariant subspace is singular.")
 
-    P = Y @ np.linalg.solve(X, np.eye(n))
+    P = V @ np.linalg.solve(U, np.eye(n))
     P = np.real_if_close(P, tol=1000)
 
     if np.iscomplexobj(P):
-        max_imag = np.max(np.abs(P.imag))
-        if max_imag > 1e-2:
+        imag_size = np.max(np.abs(np.imag(P)))
+        if imag_size > 1e-2:
             raise np.linalg.LinAlgError(
-                f"Computed Riccati solution has significant imaginary part ({max_imag:.3e})."
+                f"Riccati solution has large imaginary part: {imag_size:.3e}"
             )
-        P = P.real
+        P = np.real(P)
 
     P = np.asarray(P, dtype=float)
     P = 0.5 * (P + P.T)
     return P
 
 
-def _rk4_increment(
-    f: Callable[[float, np.ndarray], np.ndarray],
+def _rk4_step(
+    fun: Callable[[float, np.ndarray], np.ndarray],
     t: float,
     y: np.ndarray,
     h: float,
 ) -> np.ndarray:
-    k1 = np.asarray(f(t, y), dtype=float)
-    k2 = np.asarray(f(t + 0.5 * h, y + 0.5 * h * k1), dtype=float)
-    k3 = np.asarray(f(t + 0.5 * h, y + 0.5 * h * k2), dtype=float)
-    k4 = np.asarray(f(t + h, y + h * k3), dtype=float)
-    return (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    k1 = np.asarray(fun(t, y), dtype=float)
+    k2 = np.asarray(fun(t + 0.5 * h, y + 0.5 * h * k1), dtype=float)
+    k3 = np.asarray(fun(t + 0.5 * h, y + 0.5 * h * k2), dtype=float)
+    k4 = np.asarray(fun(t + h, y + h * k3), dtype=float)
+    return y + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
-def _advance_with_control(
-    f: Callable[[float, np.ndarray], np.ndarray],
-    t_start: float,
-    y_start: np.ndarray,
-    t_stop: float,
+def _integrate_between_output_times(
+    fun: Callable[[float, np.ndarray], np.ndarray],
+    t0: float,
+    y0: np.ndarray,
+    t1: float,
     rtol: float,
     atol: float,
 ) -> np.ndarray:
     """
-    Adaptive RK4 on one interval [t_start, t_stop] using step-doubling
-    for error estimation.
+    Adaptive RK4 with step doubling on one segment [t0, t1].
     """
-    if t_stop == t_start:
-        return y_start.copy()
+    if t1 == t0:
+        return y0.copy()
 
-    y = y_start.copy()
-    t = float(t_start)
+    direction = 1.0 if t1 > t0 else -1.0
+    total_length = abs(t1 - t0)
 
-    sign = 1.0 if t_stop >= t_start else -1.0
-    remaining_total = abs(t_stop - t_start)
+    t = float(t0)
+    y = y0.copy()
 
-    h = min(1e-3, remaining_total)
+    h = min(total_length, 1e-3)
 
-    while sign * (t_stop - t) > 0.0:
-        h = min(h, abs(t_stop - t))
-        hs = sign * h
+    while direction * (t1 - t) > 0.0:
+        h = min(h, abs(t1 - t))
+        hs = direction * h
 
-        y_one = y + _rk4_increment(f, t, y, hs)
+        y_full = _rk4_step(fun, t, y, hs)
 
-        y_half = y + _rk4_increment(f, t, y, 0.5 * hs)
-        y_two = y_half + _rk4_increment(f, t + 0.5 * hs, y_half, 0.5 * hs)
+        y_half = _rk4_step(fun, t, y, 0.5 * hs)
+        y_two_half = _rk4_step(fun, t + 0.5 * hs, y_half, 0.5 * hs)
 
-        err_est = y_two - y_one
-        denom = atol + rtol * np.maximum(np.abs(y), np.abs(y_two))
-        ratio = np.max(np.abs(err_est) / denom)
+        err = y_two_half - y_full
+        scale = atol + rtol * np.maximum(np.abs(y), np.abs(y_two_half))
+        err_norm = np.max(np.abs(err) / scale)
 
-        if ratio <= 1.0:
+        if err_norm <= 1.0:
             t = t + hs
-            y = y_two
+            y = y_two_half
 
-            if ratio == 0.0:
+            if err_norm == 0.0:
                 growth = 2.0
             else:
-                growth = 0.9 * ratio ** (-0.2)
+                growth = 0.9 * err_norm ** (-0.2)
                 growth = min(2.0, max(1.2, growth))
-            h *= growth
+            h = min(total_length, h * growth)
         else:
-            shrink = 0.9 * ratio ** (-0.2)
+            shrink = 0.9 * err_norm ** (-0.2)
             shrink = max(0.1, shrink)
-            h *= shrink
-
+            h = h * shrink
             if h < 1e-12:
-                raise RuntimeError("Step size became too small during integration.")
+                raise RuntimeError("Adaptive RK4 step size underflow.")
 
     return y
 
@@ -165,18 +161,19 @@ def solve_ivp(
     **kwargs,
 ) -> OdeResult:
     """
-    Lightweight SciPy-like IVP solver.
+    Minimal SciPy-like IVP solver for this project.
 
-    It integrates successively between output times using adaptive RK4.
+    It advances adaptively between consecutive output times using RK4
+    with step-doubling error control.
     """
-    _ = kwargs
+    del kwargs
 
     t0 = float(t_span[0])
     tf = float(t_span[1])
 
     y0 = np.asarray(y0, dtype=float)
     if y0.ndim != 1:
-        raise ValueError("y0 must be a one-dimensional array.")
+        raise ValueError("y0 must be one-dimensional.")
 
     if args:
         def wrapped_fun(t: float, y: np.ndarray) -> np.ndarray:
@@ -192,30 +189,29 @@ def solve_ivp(
         if t_grid.ndim != 1:
             raise ValueError("t_eval must be one-dimensional.")
         if t_grid.size == 0:
-            raise ValueError("t_eval cannot be empty.")
-        if not np.isclose(t_grid[0], t0) or not np.isclose(t_grid[-1], tf):
-            raise ValueError("t_eval must begin at t_span[0] and end at t_span[1].")
+            raise ValueError("t_eval must contain at least one time.")
+        if abs(t_grid[0] - t0) > 1e-12 or abs(t_grid[-1] - tf) > 1e-12:
+            raise ValueError("t_eval must start at t_span[0] and end at t_span[1].")
 
-    nstate = y0.size
-    ntimes = t_grid.size
+    n = y0.size
+    m = t_grid.size
+    y = np.zeros((n, m), dtype=float)
+    y[:, 0] = y0
 
-    Y = np.zeros((nstate, ntimes), dtype=float)
-    Y[:, 0] = y0
+    current_t = t_grid[0]
+    current_y = y0.copy()
 
-    y_curr = y0.copy()
-    t_curr = t_grid[0]
-
-    for k in range(1, ntimes):
-        t_next = t_grid[k]
-        y_curr = _advance_with_control(
+    for j in range(m - 1):
+        next_t = t_grid[j + 1]
+        current_y = _integrate_between_output_times(
             wrapped_fun,
-            t_curr,
-            y_curr,
-            t_next,
+            current_t,
+            current_y,
+            next_t,
             rtol=rtol,
             atol=atol,
         )
-        Y[:, k] = y_curr
-        t_curr = t_next
+        current_t = next_t
+        y[:, j + 1] = current_y
 
-    return OdeResult(t=t_grid, y=Y)
+    return OdeResult(t=t_grid, y=y)
